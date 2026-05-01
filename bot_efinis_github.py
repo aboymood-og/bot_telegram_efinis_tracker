@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 import time
 import threading
 from datetime import datetime, timedelta
+import json
 
 # ==========================================
 # 1. CONFIGURACIÓN
@@ -122,8 +123,118 @@ def rastrear_documento_nuevo(url_carpeta, nombre_curso, session, ruta_actual="")
         else:
             return f"❓ *{nombre_curso}*\n   • Se añadió un archivo pero está oculto por el profesor o hubo un error de plataforma.\n   • [Enlace a Documentos]({url_carpeta})"
 
-# Aquí irán después las otras funciones auxiliares:
-# def procesar_anuncio(...):
+def procesar_anuncio_nuevo(url_anuncios, nombre_curso, session):
+    """
+    Consulta la API AJAX de Chamilo para obtener los anuncios.
+    Filtra los recientes y extrae información extra (como adjuntos).
+    """
+    # 1. Extraer el 'cidReq' (ID del curso) de la URL que nos llega del Dashboard
+    # Ej: de "https://.../announcements.php?cidReq=2621902&..." sacamos "2621902"
+    from urllib.parse import urlparse, parse_qs
+    parsed_url = urlparse(url_anuncios)
+    cid_req = parse_qs(parsed_url.query).get('cidReq', [None])[0]
+    
+    if not cid_req:
+        return f"❓ *{nombre_curso}*\n   • Hubo un error procesando el enlace del anuncio.\n   • [Enlace a Anuncios]({url_anuncios})"
+
+    # 2. Armar la URL de la API secreta de jqGrid (la que descubrimos en el HTML)
+    api_url = f"https://efinis.uft.cl/main/inc/ajax/model.ajax.php?a=get_course_announcements&cidReq={cid_req}&id_session=0&gidReq=0&gradebook=0&origin=&title_to_search=&user_id_to_search=0&rows=20&page=1"
+    
+    response = session.get(api_url)
+    
+    try:
+        data = response.json()
+        filas = data.get('rows', [])
+    except json.JSONDecodeError:
+        return f"❓ *{nombre_curso}*\n   • Error al leer los anuncios (la plataforma no respondió correctamente).\n   • [Enlace a Anuncios]({url_anuncios})"
+
+    if not filas:
+         return f"❓ *{nombre_curso}*\n   • Se detectó un anuncio pero la lista aparece vacía.\n   • [Enlace a Anuncios]({url_anuncios})"
+
+    # Usamos 35 mins de margen
+    limite_tiempo = datetime.now() - timedelta(minutes=35) 
+    
+    mensajes_novedades = []
+
+    # 3. Procesar las filas del JSON
+    # jqGrid devuelve una lista de diccionarios. La clave 'cell' contiene los datos.
+    for fila in filas:
+        celdas = fila.get('cell', [])
+        if len(celdas) < 4: continue
+        
+        html_titulo = celdas[0]
+        # Usamos bs4 rapidito para limpiar el HTML que viene dentro del JSON
+        soup_titulo = BeautifulSoup(html_titulo, 'html.parser')
+        
+        a_tag = soup_titulo.find('a')
+        if not a_tag: continue
+        
+        titulo_limpio = a_tag.text.strip()
+        link_anuncio = a_tag['href']
+        
+        # Revisamos si hay ícono de clip (Adjunto)
+        tiene_adjunto = bool(soup_titulo.find('i', class_='fa-paperclip'))
+        
+        html_autor = celdas[1]
+        soup_autor = BeautifulSoup(html_autor, 'html.parser')
+        autor_limpio = soup_autor.text.strip()
+        
+        fecha_str = celdas[2] # Ej: "30 de Abril 2026 a las 08:48 AM"
+        
+        # Aquí viene un truco: Como la fecha viene en texto muy coloquial en español, 
+        # intentar parsearla con datetime es un infierno.
+        # Estrategia: Asumiremos que si el script llegó hasta aquí empujado por el ícono 
+        # de la campanita del Dashboard (que ya filtró por "última visita"), 
+        # entonces los primeros anuncios de la lista SON la novedad.
+        
+        # Extraemos el contenido del anuncio haciendo una petición a su vista individual
+        response_vista = session.get(link_anuncio)
+        soup_vista = BeautifulSoup(response_vista.text, 'html.parser')
+        
+        # 1. Aislamos el contenido central (Ignoramos el menú superior para no agarrar tu nombre/correo)
+        area_central = soup_vista.find('section', id='cm-content') or soup_vista
+        
+        cuerpo_anuncio = ""
+        
+        # 2. Buscamos el panel principal donde Chamilo guarda el texto del anuncio
+        panel_contenido = area_central.find('div', class_='panel-body')
+        
+        if panel_contenido:
+            # El truco de oro: get_text(separator) respeta los <br> y <p> como saltos de línea reales
+            cuerpo_anuncio = panel_contenido.get_text(separator='\n\n', strip=True)
+        else:
+             # Fallback seguro: buscar párrafos solo en el área central (sin el menú)
+             textos = [p.get_text(separator='\n', strip=True) for p in area_central.find_all('p')]
+             cuerpo_anuncio = "\n\n".join(textos).strip()
+             
+        # Lógica de [Leer más]
+        # Le subimos el límite a 450 porque los saltos de línea ocupan "espacio"
+        if len(cuerpo_anuncio) > 450: 
+             cuerpo_anuncio = cuerpo_anuncio[:450] + "...\n\n[Leer más]"
+
+        # Armado del Mensaje Final
+        mensaje = f"🔔 *NUEVO ANUNCIO EN:* {nombre_curso}\n"
+        mensaje += f"   • *Asunto:* {titulo_limpio}\n"
+        mensaje += f"   • *Autor:* {autor_limpio}\n"
+        mensaje += f"   • *Fecha:* {fecha_str}\n"
+        
+        if tiene_adjunto:
+             mensaje += f"   • 📎 *¡Atención!* Este anuncio incluye un archivo adjunto.\n"
+             
+        mensaje += f"\n   *Mensaje:*\n   _{cuerpo_anuncio}_\n"
+        mensaje += f"\n   • [Ir al Anuncio]({link_anuncio})"
+        
+        mensajes_novedades.append(mensaje)
+        
+        # Solo procesamos el primer (o primeros) anuncios nuevos de la lista para no saturar.
+        # Si hay más de uno, la paginación u otras revisiones lo atraparán.
+        break # Detenemos el loop tras el anuncio más reciente (el primero en la lista JSON)
+
+    if mensajes_novedades:
+        return "\n\n".join(mensajes_novedades)
+    else:
+        return f"❓ *{nombre_curso}*\n   • No se pudo extraer la información del anuncio nuevo.\n   • [Enlace a Anuncios]({url_anuncios})"
+
 # def procesar_tarea(...):
 
 # ==========================================
@@ -182,6 +293,12 @@ def revisar_efinis():
                     if 'folder_document.png' in icono.get('src', ''):
                         mensaje = rastrear_documento_nuevo(link, nombre_curso, session, ruta_actual="Documentos")
                         novedades_encontradas.append(mensaje)
+                        
+                    # NUEVO: Verificamos si el ícono corresponde a la campanita de Anuncios
+                    elif 'valves.png' in icono.get('src', ''):
+                        mensaje = procesar_anuncio_nuevo(link, nombre_curso, session)
+                        novedades_encontradas.append(mensaje)
+                        
                     else:
                         mensaje_generico = f"🔔 *NOVEDAD EN:* {nombre_curso}\n   • {detalle}\n   • [Enlace directo]({link})"
                         novedades_encontradas.append(mensaje_generico)
