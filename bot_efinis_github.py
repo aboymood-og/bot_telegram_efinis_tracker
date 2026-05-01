@@ -5,6 +5,7 @@ import time
 import threading
 from datetime import datetime, timedelta
 import json
+import re
 
 # ==========================================
 # 1. CONFIGURACIÓN
@@ -235,7 +236,140 @@ def procesar_anuncio_nuevo(url_anuncios, nombre_curso, session):
     else:
         return f"❓ *{nombre_curso}*\n   • No se pudo extraer la información del anuncio nuevo.\n   • [Enlace a Anuncios]({url_anuncios})"
 
-# def procesar_tarea(...):
+def procesar_tarea_nueva(url_tarea, nombre_curso, session):
+    """
+    Consulta la API AJAX para Tareas. 
+    Busca la tarea más reciente (por ID) y detecta tareas a punto de vencer.
+    """
+    from urllib.parse import urlparse, parse_qs
+    parsed_url = urlparse(url_tarea)
+    cid_req = parse_qs(parsed_url.query).get('cidReq', [None])[0]
+    
+    if not cid_req:
+        return f"❓ *{nombre_curso}*\n   • Hubo un error procesando el enlace de la tarea.\n   • [Ir a Tareas]({url_tarea})"
+
+    api_url = f"https://efinis.uft.cl/main/inc/ajax/model.ajax.php?a=get_work_student&cidReq={cid_req}&id_session=0&gidReq=0&gradebook=0&origin=&rows=50&page=1"
+    response = session.get(api_url)
+    
+    try:
+        data = response.json()
+        filas = data.get('rows', [])
+    except Exception:
+        return f"❓ *{nombre_curso}*\n   • Error al leer las tareas.\n   • [Ir a Tareas]({url_tarea})"
+
+    if not filas:
+         return f"❓ *{nombre_curso}*\n   • El ícono indica tarea, pero la lista está vacía.\n   • [Ir a Tareas]({url_tarea})"
+
+    ahora = datetime.now()
+    tareas_parseadas = []
+
+    # 1. PARSEAR TODAS LAS TAREAS DE LA LISTA
+    for fila in filas:
+        celdas = fila.get('cell', [])
+        if len(celdas) < 5: continue
+        
+        soup_titulo = BeautifulSoup(celdas[1], 'html.parser')
+        a_tag = soup_titulo.find('a')
+        if not a_tag: continue
+        
+        titulo_limpio = a_tag.text.strip()
+        link_tarea = a_tag['href']
+        if link_tarea.startswith('/'): link_tarea = "https://efinis.uft.cl" + link_tarea
+            
+        # Extraer el ID mágico de la tarea
+        match_id = re.search(r'id=(\d+)', link_tarea)
+        tarea_id = int(match_id.group(1)) if match_id else 0
+
+        fecha_limite_str = celdas[2]
+        ultima_subida_str = celdas[4]
+        
+        tiene_fecha_limite = bool(fecha_limite_str and "&nbsp;" not in fecha_limite_str)
+        fecha_limite_obj = None
+        
+        if tiene_fecha_limite:
+            fecha_limite_obj = datetime.strptime(fecha_limite_str, "%Y-%m-%d %H:%M:%S")
+            str_imprimir_vencimiento = fecha_limite_obj.strftime("%d/%m/%Y a las %H:%M")
+        else:
+            str_imprimir_vencimiento = "Sin fecha límite"
+
+        ya_entregada = bool(ultima_subida_str and "&nbsp;" not in ultima_subida_str)
+
+        tareas_parseadas.append({
+            'id': tarea_id,
+            'titulo': titulo_limpio,
+            'link': link_tarea,
+            'vence_obj': fecha_limite_obj,
+            'vence_str': str_imprimir_vencimiento,
+            'ya_entregada': ya_entregada,
+            'ultima_subida_str': ultima_subida_str
+        })
+
+    # ==========================================
+    # LÓGICA DE DECISIÓN: NUEVA VS RECORDATORIO
+    # ==========================================
+    mensajes_finales = []
+    
+    # Encontramos la tarea con el ID más alto (La real "última subida por el profe")
+    tarea_mas_nueva = max(tareas_parseadas, key=lambda x: x['id'])
+    
+    # Filtramos tareas que estén por vencer (menos de 48 horas y no entregadas)
+    tareas_recordatorio = []
+    for t in tareas_parseadas:
+        if t['vence_obj'] and not t['ya_entregada']:
+            tiempo_restante = t['vence_obj'] - ahora
+            if 0 < tiempo_restante.total_seconds() <= (48 * 3600):
+                # Evitamos duplicados si la tarea nueva TAMBIÉN es urgente
+                if t['id'] != tarea_mas_nueva['id']:
+                    tareas_recordatorio.append(t)
+
+    # Función interna para no repetir código de scraping
+    def obtener_instrucciones(link):
+        resp = session.get(link)
+        s = BeautifulSoup(resp.text, 'html.parser')
+        area = s.find('section', id='cm-content') or s
+        caja = area.find('div', class_='alert-info') or area.find('div', class_='description')
+        if caja: return caja.get_text(separator='\n\n', strip=True)
+        textos = [p.get_text(separator='\n', strip=True) for p in area.find_all('p')]
+        return "\n\n".join(textos).strip()
+
+    # --- ARMAR MENSAJE: TAREA NUEVA ---
+    inst_nueva = obtener_instrucciones(tarea_mas_nueva['link'])
+    if len(inst_nueva) > 300: inst_nueva = inst_nueva[:300] + "...\n\n[Leer más en eFinis]"
+    elif not inst_nueva: inst_nueva = "Sin instrucciones adicionales."
+    
+    msg_nueva = f"📝 *NUEVA TAREA EN:* {nombre_curso}\n\n"
+    msg_nueva += f"   • *Título:* {tarea_mas_nueva['titulo']}\n"
+    msg_nueva += f"   • *Vence:* {tarea_mas_nueva['vence_str']}\n"
+    
+    if tarea_mas_nueva['ya_entregada']:
+         f_subida = datetime.strptime(tarea_mas_nueva['ultima_subida_str'], "%Y-%m-%d %H:%M:%S").strftime("%d/%m/%Y a las %H:%M")
+         msg_nueva += f"   • ✅ *ESTADO:* YA SUBISTE ESTA TAREA el {f_subida}\n"
+    else:
+         msg_nueva += f"   • ❌ *ESTADO:* Sin enviar\n"
+         
+    msg_nueva += f"\n   *Instrucciones:*\n   _{inst_nueva}_\n"
+    msg_nueva += f"\n   • [Ir a la Tarea]({tarea_mas_nueva['link']})"
+    
+    mensajes_finales.append(msg_nueva)
+
+    # --- ARMAR MENSAJE(S): RECORDATORIOS ---
+    for tr in tareas_recordatorio:
+        inst_rec = obtener_instrucciones(tr['link'])
+        if len(inst_rec) > 300: inst_rec = inst_rec[:300] + "...\n\n[Leer más en eFinis]"
+        elif not inst_rec: inst_rec = "Sin instrucciones."
+        
+        msg_rec = f"🚨 *RECORDATORIO URGENTE:* {nombre_curso}\n"
+        msg_rec += f"   _¡Yapo, sube la tarea! Queda poco tiempo._\n\n"
+        msg_rec += f"   • *Título:* {tr['titulo']}\n"
+        msg_rec += f"   • *Vence:* {tr['vence_str']}\n"
+        msg_rec += f"   • ❌ *ESTADO:* Sin enviar\n"
+        msg_rec += f"\n   *Instrucciones:*\n   _{inst_rec}_\n"
+        msg_rec += f"\n   • [Ir a la Tarea]({tr['link']})"
+        
+        mensajes_finales.append(msg_rec)
+
+    # Devolvemos todos los mensajes juntos (por si hay una tarea nueva Y un recordatorio simultáneos)
+    return "\n\n".join(mensajes_finales)
 
 # ==========================================
 # 3. FUNCIÓN DE SCRAPING (OPTIMIZADA)
@@ -297,6 +431,11 @@ def revisar_efinis():
                     # NUEVO: Verificamos si el ícono corresponde a la campanita de Anuncios
                     elif 'valves.png' in icono.get('src', ''):
                         mensaje = procesar_anuncio_nuevo(link, nombre_curso, session)
+                        novedades_encontradas.append(mensaje)
+
+                    # NUEVO: Verificamos si el ícono corresponde al Lápiz de Tareas
+                    elif 'works.png' in icono.get('src', ''):
+                        mensaje = procesar_tarea_nueva(link, nombre_curso, session)
                         novedades_encontradas.append(mensaje)
                         
                     else:
