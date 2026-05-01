@@ -3,7 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ==========================================
 # 1. CONFIGURACIÓN
@@ -25,7 +25,109 @@ headers = {
 }
 
 # ==========================================
-# 2. FUNCIÓN DE SCRAPING (OPTIMIZADA)
+# 2. FUNCIONES AUXILIARES (CASOS DE USO)
+# ==========================================
+def rastrear_documento_nuevo(url_carpeta, nombre_curso, session, ruta_actual=""):
+    """
+    Navega por las carpetas buscando el archivo más reciente (últimos 35 mins).
+    Usa recursividad para entrar en subcarpetas.
+    """
+    # --- EL hack DE LA PAGINACIÓN ---
+    # Revisamos si la URL ya tiene el símbolo '?' para saber si añadir un '&' o un '?'
+    separador = '&' if '?' in url_carpeta else '?'
+    
+    # Inyectamos el parámetro brutal que descubriste (le pongo 1000 por si algún profe enloquece subiendo cosas)
+    url_optimizada = f"{url_carpeta}{separador}student_table_per_page=1000"
+    
+    # Hacemos la petición a la carpeta forzando a que muestre todo
+    response = session.get(url_optimizada)
+    response = session.get(url_carpeta)
+    soup = BeautifulSoup(response.text, 'html.parser')
+    
+    # Buscamos la tabla de documentos
+    tabla = soup.find('table', class_='data_table')
+    
+    # Caso: Tabla no existe (Sección vacía o bloqueada)
+    if not tabla:
+        if ruta_actual: # Significa que crearon una carpeta y no le pusieron nada dentro
+            return f"📁 *{nombre_curso}*\n   • Se detectó la creación de la carpeta `{ruta_actual}` (actualmente vacía).\n   • [Enlace a la carpeta]({url_carpeta})"
+        else: # Oculto en la raíz
+            return f"❓ *{nombre_curso}*\n   • Se añadió un archivo pero está oculto por el profesor o hubo un error.\n   • [Enlace a Documentos]({url_carpeta})"
+            
+    filas = tabla.find_all('tr')[1:] # Ignoramos la primera fila (los encabezados)
+    
+    elemento_mas_reciente = None
+    fecha_maxima = datetime.min
+    # Usamos 35 mins de margen para evitar perder algo si el ciclo se retrasa unos segundos
+    limite_tiempo = datetime.now() - timedelta(minutes=35) 
+    
+    # Recorremos cada fila para extraer fechas
+    for fila in filas:
+        columnas = fila.find_all('td')
+        if len(columnas) < 4: continue
+        
+        # 1. ¿Es carpeta o archivo? (Miramos el ícono en la primera columna)
+        es_carpeta = False
+        img_tag = columnas[0].find('img')
+        if img_tag and 'folder' in img_tag.get('src', ''):
+            es_carpeta = True
+            
+        # 2. Nombre y Link (Segunda columna)
+        a_tag = columnas[1].find('a')
+        nombre = a_tag.text.strip()
+        link = a_tag['href']
+        if link.startswith('/'): # Prevenir rutas relativas
+            link = "https://efinis.uft.cl" + link
+            
+        # 3. Extraer la fecha del span oculto (Cuarta columna)
+        span_fecha = columnas[3].find('span')
+        if span_fecha:
+            try:
+                # Convertimos el string "2026-04-30 08:48:21" a un objeto de tiempo real
+                fecha_obj = datetime.strptime(span_fecha.text.strip(), "%Y-%m-%d %H:%M:%S")
+                
+                # Vamos guardando siempre el que sea más nuevo
+                if fecha_obj > fecha_maxima:
+                    fecha_maxima = fecha_obj
+                    elemento_mas_reciente = {
+                        "nombre": nombre,
+                        "link": link,
+                        "es_carpeta": es_carpeta,
+                        "fecha": fecha_obj
+                    }
+            except ValueError:
+                continue
+
+    # ==========================================
+    # LÓGICA DE DECISIÓN BASADA EN LO ENCONTRADO
+    # ==========================================
+    
+    # Si encontramos algo y ese algo fue subido en los últimos 35 minutos
+    if elemento_mas_reciente and elemento_mas_reciente['fecha'] >= limite_tiempo:
+        
+        if elemento_mas_reciente['es_carpeta']:
+            # RECURSIVIDAD: Si es carpeta, construimos la ruta y volvemos a llamar a la función
+            nueva_ruta = f"{ruta_actual}/{elemento_mas_reciente['nombre']}"
+            return rastrear_documento_nuevo(elemento_mas_reciente['link'], nombre_curso, session, nueva_ruta)
+            
+        else:
+            # ES ARCHIVO: Fin de la búsqueda, tenemos a nuestro ganador
+            ruta_final = f"{ruta_actual}/{elemento_mas_reciente['nombre']}"
+            return f"📄 *{nombre_curso}*\n   • Se añadió un archivo: `{ruta_final}`\n   • [Descargar/Ver archivo]({elemento_mas_reciente['link']})"
+            
+    else:
+        # Nada superó el límite de tiempo. Es el caso de archivos ocultos o carpetas vacías.
+        if ruta_actual:
+            return f"📁 *{nombre_curso}*\n   • Se detectó una nueva carpeta vacía o con archivos ocultos en: `{ruta_actual}`\n   • [Ver carpeta]({url_carpeta})"
+        else:
+            return f"❓ *{nombre_curso}*\n   • Se añadió un archivo pero está oculto por el profesor o hubo un error de plataforma.\n   • [Enlace a Documentos]({url_carpeta})"
+
+# Aquí irán después las otras funciones auxiliares:
+# def procesar_anuncio(...):
+# def procesar_tarea(...):
+
+# ==========================================
+# 3. FUNCIÓN DE SCRAPING (OPTIMIZADA)
 # ==========================================
 def revisar_efinis():
     global session # Usamos la sesión global
@@ -72,13 +174,17 @@ def revisar_efinis():
             iconos_nuevos = titulo_tag.find_all('img', alt=lambda value: value and 'Desde su última visita' in value)
             
             if iconos_nuevos:
-                mensaje_curso = f"🔔 *NOVEDAD EN:* {nombre_curso}\n"
                 for icono in iconos_nuevos:
                     detalle = icono.get('alt')
                     link = icono.parent.get('href')
-                    mensaje_curso += f"   • {detalle}\n   • [Enlace directo]({link})\n"
-                
-                novedades_encontradas.append(mensaje_curso)
+                    
+                    # Verificamos si el ícono corresponde a la carpeta de documentos
+                    if 'folder_document.png' in icono.get('src', ''):
+                        mensaje = rastrear_documento_nuevo(link, nombre_curso, session, ruta_actual="Documentos")
+                        novedades_encontradas.append(mensaje)
+                    else:
+                        mensaje_generico = f"🔔 *NOVEDAD EN:* {nombre_curso}\n   • {detalle}\n   • [Enlace directo]({link})"
+                        novedades_encontradas.append(mensaje_generico)
                 
         return novedades_encontradas
 
@@ -87,7 +193,7 @@ def revisar_efinis():
         return [f"Error técnico: {e}"]
 
 # ==========================================
-# 3. BUCLE AUTOMÁTICO (Programado a las :00 y :30)
+# 4. BUCLE AUTOMÁTICO (Programado a las :00 y :30)
 # ==========================================
 def bucle_automatico():
     while True:
@@ -119,7 +225,7 @@ def bucle_automatico():
                 bot.send_message(CHAT_ID_DESTINO, novedad, parse_mode='Markdown')
 
 # ==========================================
-# 4. INTERACCIÓN CON TELEGRAM
+# 5. INTERACCIÓN CON TELEGRAM
 # ==========================================
 @bot.message_handler(commands=['start', 'ayuda'])
 def enviar_bienvenida(message):
@@ -137,7 +243,7 @@ def comando_revisar(message):
             bot.send_message(message.chat.id, novedad, parse_mode='Markdown')
 
 # ==========================================
-# 5. ARRANQUE
+# 6. ARRANQUE
 # ==========================================
 if __name__ == '__main__':
     # Arrancamos el hilo automático en segundo plano
