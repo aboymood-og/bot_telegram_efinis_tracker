@@ -35,8 +35,6 @@ def log_terminal(mensaje):
     hora_actual = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     print(f"\n[{hora_actual}] {mensaje}")
 
-
-    
 def rastrear_documento_nuevo(url_carpeta, nombre_curso, session, ruta_actual=""):
     """
     Navega por las carpetas buscando el archivo más reciente (últimos 35 mins).
@@ -397,18 +395,33 @@ def revisar_efinis(origen="Automático"):
                 "submitAuth": "",
                 "_qf_formLogin": ""
             }
+            # Hacemos el POST de login
             response_login = session.post(URL_LOGIN, data=payload_login, headers=headers)
             
-            if "Contraseña incorrecta" in response_login.text:
-                log_terminal("❌ ERROR CRÍTICO: Contraseña incorrecta rechazada por el portal.")
-                return ["Error al iniciar sesión. Revisa credenciales."]
+            # ==========================================
+            # VALIDACIÓN EXACTA DE CREDENCIALES (Por URL)
+            # ==========================================
+            if "loginFailed=1" in response_login.url or "user_password_incorrect" in response_login.url:
+                log_terminal("❌ ERROR CRÍTICO: Credenciales (RUT y/o contraseña) rechazadas por el portal.")
+                
+                try:
+                    mensaje_auxilio = "🚨 *ALERTA CRÍTICA DEL BOT*\n\nHe intentado entrar a eFinis pero mi acceso fue denegado. Es probable que haya un error en tus credenciales (RUT y/o contraseña) o el portal esté caído.\n\n_Por favor, para el código de python, actualiza la configuración en el código fuente, y haz funcionar denuevo el script para seguir trabajando._"
+                    bot.send_message(CHAT_ID_DESTINO, mensaje_auxilio, parse_mode='Markdown')
+                except Exception as e:
+                    log_terminal(f"No se pudo enviar la alerta de auxilio por Telegram: {e}")
+                    
+                # Devolvemos un código interno para que Telegram no mande un segundo mensaje
+                return ["FLAG_SILENCIO"]
+            # ==========================================
             
             log_terminal("✅ Login exitoso. Sesión renovada.")
+            # Pedimos el Dashboard ahora que estamos seguros de que entramos
             response_cursos = session.get(URL_CURSOS, headers=headers)
+            
         else:
             log_terminal(f"⚡ Sesión activa mantenida. Revisando plataforma... (Origen: {origen})")
 
-        # 2. EXTRACCIÓN DE DATOS (El resto de tu función BeautifulSoup queda exactamente igual hacia abajo)
+        # 2. EXTRACCIÓN DE DATOS
         soup = BeautifulSoup(response_cursos.text, 'html.parser')
         novedades_encontradas = []
         
@@ -496,11 +509,12 @@ def bucle_automatico():
         log_terminal("⏰ ¡Hora en punto! Disparando revisión automática...")
         novedades = revisar_efinis(origen="Automático")
         
-        if novedades and "Error" not in novedades[0] and "No se encontró" not in novedades[0]:
+        # Agregamos la condición para que no procese el FLAG_SILENCIO
+        if novedades and novedades[0] != "FLAG_SILENCIO" and "Error" not in novedades[0] and "No se encontró" not in novedades[0]:
             log_terminal(f"📬 Se encontraron {len(novedades)} novedades. Despachando a Telegram...")
             for novedad in novedades:
                 bot.send_message(CHAT_ID_DESTINO, novedad, parse_mode='Markdown')
-        else:
+        elif not novedades:
             log_terminal("✅ Revisión automática finalizada. Nada nuevo reportado.")
 
 # ==========================================
@@ -511,6 +525,7 @@ def enviar_bienvenida(message):
     bot.reply_to(message, f"¡Hola! Tu Chat ID es: `{message.chat.id}`. Ponlo en la configuración del script.")
 
 @bot.message_handler(commands=['revisar'])
+@bot.message_handler(commands=['revisar'])
 def comando_revisar(message):
     log_terminal(f"📱 Petición MANUAL recibida desde Telegram (Usuario: {message.chat.id})")
     bot.send_message(message.chat.id, "⏳ Revisando eFinis...")
@@ -519,6 +534,9 @@ def comando_revisar(message):
     
     if not novedades:
         bot.send_message(message.chat.id, "✅ Todo limpio.")
+    elif novedades[0] == "FLAG_SILENCIO":
+        # Ignoramos esto porque la alerta gigante ya se envió por dentro de la función
+        pass
     else:
         for novedad in novedades:
             bot.send_message(message.chat.id, novedad, parse_mode='Markdown')
