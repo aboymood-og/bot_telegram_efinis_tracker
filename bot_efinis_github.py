@@ -34,6 +34,8 @@ def log_terminal(mensaje):
     """Genera un log en la terminal con la fecha y hora exactas y un salto de línea."""
     hora_actual = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     print(f"\n[{hora_actual}] {mensaje}")
+
+
     
 def rastrear_documento_nuevo(url_carpeta, nombre_curso, session, ruta_actual=""):
     """
@@ -454,19 +456,38 @@ def revisar_efinis(origen="Automático"):
         return [f"Error técnico: {e}"]
 
 # ==========================================
-# 4. BUCLE AUTOMÁTICO (Programado cada 15 mins)
+# 4. BUCLE AUTOMÁTICO (Cada 15 mins + Modo Sueño)
 # ==========================================
 def bucle_automatico():
     while True:
         ahora = datetime.now()
         
-        # Matemáticas elegantes para saltos de 15 en 15
+        # --- MODO SUEÑO: De 00:00 a 07:59 ---
+        # Si la hora es menor a 8 (es decir, 0, 1, 2, 3, 4, 5, 6 o 7)
+        if 0 <= ahora.hour < 8:
+            # Calculamos a qué hora exacta debe despertar (Hoy a las 08:00:00)
+            hora_despertar = ahora.replace(hour=8, minute=0, second=0, microsecond=0)
+            
+            # Calculamos los segundos que faltan hasta esa hora
+            segundos_dormir = (hora_despertar - ahora).total_seconds()
+            
+            log_terminal("🌙 Entrando en MODO SUEÑO. Bucle automático pausado.")
+            log_terminal(f"💤 El bot hibernará hasta las 08:00 AM ({(segundos_dormir/3600):.2f} horas).")
+            
+            # Dormimos el hilo automático de una sola vez
+            time.sleep(segundos_dormir)
+            log_terminal("☀️ ¡Buenos días! Saliendo del Modo Sueño.")
+            
+            # Al despertar, usamos 'continue' para reiniciar el ciclo while y sincronizar a los 15 mins
+            continue 
+        # ------------------------------------
+        
+        # Matemáticas elegantes para saltos de 15 en 15 (Solo llega aquí si está despierto)
         minutos_faltantes = 15 - (ahora.minute % 15)
         segundos_a_esperar = (minutos_faltantes * 60) - ahora.second
         
-        # Calculamos la hora exacta en la que despertará para el print
-        hora_despertar = ahora + timedelta(seconds=segundos_a_esperar)
-        hora_str = hora_despertar.strftime("%H:%M:%S")
+        hora_despertar_normal = ahora + timedelta(seconds=segundos_a_esperar)
+        hora_str = hora_despertar_normal.strftime("%H:%M:%S")
         
         log_terminal(f"💤 Bot en pausa. Dormirá {minutos_faltantes} minutos. Próximo escaneo a las {hora_str}")
         
