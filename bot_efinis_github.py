@@ -6,21 +6,22 @@ import threading
 from datetime import datetime, timedelta
 import json
 import re
+from urllib.parse import urlparse, parse_qs
 
 # ==========================================
-# 1. CONFIGURACIÓN
+# 1. CONFIGURACIÓN E INICIALIZACIÓN
 # ==========================================
 TOKEN_TELEGRAM = "TU_TOKEN_DE_TELEGRAM_AQUI"
 RUT_EFINIS = "tu_rut_aqui"
 PASS_EFINIS = "tu_contraseña_aqui"
-CHAT_ID_DESTINO = "TU_CHAT_ID" # Necesitamos tu ID para los mensajes automáticos
+CHAT_ID_DESTINO = "TU_CHAT_ID"
 
 bot = telebot.TeleBot(TOKEN_TELEGRAM)
 
 URL_LOGIN = "https://efinis.uft.cl/index.php"
 URL_CURSOS = "https://efinis.uft.cl/user_portal.php"
 
-# Inicializamos la sesión a nivel GLOBAL para que guarde las cookies entre revisiones
+#Inicializamos la sesión a nivel GLOBAL para que guarde las cookies entre revisiones
 session = requests.Session()
 headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -29,6 +30,11 @@ headers = {
 # ==========================================
 # 2. FUNCIONES AUXILIARES (CASOS DE USO)
 # ==========================================
+def log_terminal(mensaje):
+    """Genera un log en la terminal con la fecha y hora exactas y un salto de línea."""
+    hora_actual = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    print(f"\n[{hora_actual}] {mensaje}")
+    
 def rastrear_documento_nuevo(url_carpeta, nombre_curso, session, ruta_actual=""):
     """
     Navega por las carpetas buscando el archivo más reciente (últimos 35 mins).
@@ -131,7 +137,7 @@ def procesar_anuncio_nuevo(url_anuncios, nombre_curso, session):
     """
     # 1. Extraer el 'cidReq' (ID del curso) de la URL que nos llega del Dashboard
     # Ej: de "https://.../announcements.php?cidReq=2621902&..." sacamos "2621902"
-    from urllib.parse import urlparse, parse_qs
+    
     parsed_url = urlparse(url_anuncios)
     cid_req = parse_qs(parsed_url.query).get('cidReq', [None])[0]
     
@@ -241,7 +247,7 @@ def procesar_tarea_nueva(url_tarea, nombre_curso, session):
     Consulta la API AJAX para Tareas. 
     Busca la tarea más reciente (por ID) y detecta tareas a punto de vencer.
     """
-    from urllib.parse import urlparse, parse_qs
+    
     parsed_url = urlparse(url_tarea)
     cid_req = parse_qs(parsed_url.query).get('cidReq', [None])[0]
     
@@ -374,16 +380,14 @@ def procesar_tarea_nueva(url_tarea, nombre_curso, session):
 # ==========================================
 # 3. FUNCIÓN DE SCRAPING (OPTIMIZADA)
 # ==========================================
-def revisar_efinis():
-    global session # Usamos la sesión global
+def revisar_efinis(origen="Automático"):
+    global session 
     
     try:
-        # 1. INTENTAR ACCESO DIRECTO PRIMERO
         response_cursos = session.get(URL_CURSOS, headers=headers)
         
-        # Verificamos si realmente estamos en el portal (buscamos algo único de logueado)
         if "Mis cursos" not in response_cursos.text or "Ocurrió un error" in response_cursos.text:
-            print("Sesión expirada o no iniciada. Ejecutando Login...")
+            log_terminal(f"⚠️ Sesión expirada o no iniciada. Ejecutando Login... (Origen: {origen})")
             
             payload_login = {
                 "login": RUT_EFINIS,
@@ -391,17 +395,18 @@ def revisar_efinis():
                 "submitAuth": "",
                 "_qf_formLogin": ""
             }
-            # Hacer POST para loguearse
             response_login = session.post(URL_LOGIN, data=payload_login, headers=headers)
             
-            # Verificar si el login falló
             if "Contraseña incorrecta" in response_login.text:
+                log_terminal("❌ ERROR CRÍTICO: Contraseña incorrecta rechazada por el portal.")
                 return ["Error al iniciar sesión. Revisa credenciales."]
             
-            # Si el login fue bien, volvemos a pedir la página de cursos
+            log_terminal("✅ Login exitoso. Sesión renovada.")
             response_cursos = session.get(URL_CURSOS, headers=headers)
+        else:
+            log_terminal(f"⚡ Sesión activa mantenida. Revisando plataforma... (Origen: {origen})")
 
-        # 2. EXTRACCIÓN DE DATOS (Igual que antes)
+        # 2. EXTRACCIÓN DE DATOS (El resto de tu función BeautifulSoup queda exactamente igual hacia abajo)
         soup = BeautifulSoup(response_cursos.text, 'html.parser')
         novedades_encontradas = []
         
@@ -449,36 +454,33 @@ def revisar_efinis():
         return [f"Error técnico: {e}"]
 
 # ==========================================
-# 4. BUCLE AUTOMÁTICO (Programado a las :00 y :30)
+# 4. BUCLE AUTOMÁTICO (Programado cada 15 mins)
 # ==========================================
 def bucle_automatico():
     while True:
         ahora = datetime.now()
         
-        # Calculamos cuántos minutos faltan para el próximo :00 o :30
-        if ahora.minute < 30:
-            minutos_faltantes = 30 - ahora.minute
-        else:
-            minutos_faltantes = 60 - ahora.minute
-            
-        # Lo convertimos a segundos y le restamos los segundos actuales para ser 100% exactos
+        # Matemáticas elegantes para saltos de 15 en 15
+        minutos_faltantes = 15 - (ahora.minute % 15)
         segundos_a_esperar = (minutos_faltantes * 60) - ahora.second
         
-        hora_proxima = ahora.minute + minutos_faltantes
-        if hora_proxima == 60: hora_proxima = "00"
+        # Calculamos la hora exacta en la que despertará para el print
+        hora_despertar = ahora + timedelta(seconds=segundos_a_esperar)
+        hora_str = hora_despertar.strftime("%H:%M:%S")
         
-        print(f"Zzz... El bot dormirá {minutos_faltantes} minutos. Próxima revisión exacta a las XX:{hora_proxima}")
+        log_terminal(f"💤 Bot en pausa. Dormirá {minutos_faltantes} minutos. Próximo escaneo a las {hora_str}")
         
-        # El bot se pausa exactamente el tiempo necesario
         time.sleep(segundos_a_esperar)
         
-        # --- DESPIERTA A LA HORA EN PUNTO ---
-        print("⏰ ¡Hora en punto! Ejecutando revisión automática...")
-        novedades = revisar_efinis()
+        log_terminal("⏰ ¡Hora en punto! Disparando revisión automática...")
+        novedades = revisar_efinis(origen="Automático")
         
         if novedades and "Error" not in novedades[0] and "No se encontró" not in novedades[0]:
+            log_terminal(f"📬 Se encontraron {len(novedades)} novedades. Despachando a Telegram...")
             for novedad in novedades:
                 bot.send_message(CHAT_ID_DESTINO, novedad, parse_mode='Markdown')
+        else:
+            log_terminal("✅ Revisión automática finalizada. Nada nuevo reportado.")
 
 # ==========================================
 # 5. INTERACCIÓN CON TELEGRAM
@@ -489,8 +491,10 @@ def enviar_bienvenida(message):
 
 @bot.message_handler(commands=['revisar'])
 def comando_revisar(message):
+    log_terminal(f"📱 Petición MANUAL recibida desde Telegram (Usuario: {message.chat.id})")
     bot.send_message(message.chat.id, "⏳ Revisando eFinis...")
-    novedades = revisar_efinis()
+    
+    novedades = revisar_efinis(origen="Comando Telegram")
     
     if not novedades:
         bot.send_message(message.chat.id, "✅ Todo limpio.")
